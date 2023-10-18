@@ -1,0 +1,21 @@
+[package]
+name = "sdbtreefs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.70"
+clap = { version = "4.4.6", features = ["derive"] }
+crypter = { git = "https://github.com/lemosyne/crypter.git", features = ["openssl"] }
+cryptio = { git = "https://github.com/lemosyne/cryptio.git" }
+embedded-io = { git = "https://github.com/euugenechou/embedded-io.git", features = ["std"] }
+fuse-sys = { git = "https://github.com/euugenechou/fuse-sys.git", features = ["auto"] }
+kms = { git = "https://github.com/lemosyne/kms.git" }
+libc = "0.2.149"
+log = "0.4.20"
+passthrough = { git = "https://github.com/lemosyne/passthrough.git" }
+pretty_env_logger = "0.5.0"
+rand = "0.8.5"
+sdbtree = { version = "0.1.0", path = "../../sdbtree" }
+thiserror = "1.0.40"
+umask = "2.1.0"
