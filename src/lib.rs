@@ -1,10 +1,16 @@
 pub mod error;
+mod localize;
 pub mod utils;
 
 use anyhow::Result;
 use core::ffi::*;
 use crypter::{openssl::Aes256Ctr, Crypter};
+use cryptio::iv::BlockIvCryptIo;
 use embedded_io::adapters::FromStd;
+use embedded_io::{
+    blocking::{Read, Seek, Write},
+    SeekFrom,
+};
 use error::{Error, Result as SDBResult};
 use fuse_sys::*;
 use log::*;
@@ -14,8 +20,10 @@ use sdbtree::{
     storage::{dir::DirectoryStorage, Storage},
     BKeyTree,
 };
-use std::fs::File;
+use std::{collections::HashMap, fs::File};
 use umask::Mode;
+
+use crate::localize::LocalizedBKeyTree;
 
 const AES256CTR_KEY_SZ: usize = 32;
 const DEFAULT_BLOCK_SIZE: usize = 4096;
@@ -33,6 +41,8 @@ pub struct SDBTreeFs<
     C: Crypter,
 {
     enclave: String,
+    mappings: HashMap<String, u64>,
+    links: HashMap<u64, u64>,
     inner: Passthrough,
     tree: BKeyTree<R, S, C, KEY_SZ>,
 }
@@ -64,6 +74,8 @@ where
     ) -> SDBResult<Self> {
         Ok(Self {
             enclave: enclave.as_ref().into(),
+            mappings: HashMap::new(),
+            links: HashMap::new(),
             inner: Passthrough::new::<&str>(datadir.as_ref().into()),
             tree: BKeyTree::with_storage(storage, utils::generate_key(&mut R::default()))
                 .map_err(|_| Error::Storage)?,
@@ -142,28 +154,12 @@ where
         self.inner.mkdir(path, mode | 0o666)
     }
 
-    // fn unlink(&mut self, path: &str) -> Result<i32> {
-    //     debug!("unlink: path = {path}");
-
-    //     let res = self.inner.unlink(path)?;
-    //     if res == 0 {
-    //         let khf_id = self
-    //             .mappings
-    //             .remove(&self.inode_path(path))
-    //             .ok_or(Error::MissingKhf(path.to_string()))?;
-    //         let links = self.links.entry(khf_id).or_insert(1);
-
-    //         *links -= 1;
-
-    //         if *links == 0 {
-    //             self.allocator.dealloc(khf_id).map_err(|_| Error::Dealloc)?;
-    //             self.inode_khfs.remove(&khf_id);
-    //             self.master_khf.update(khf_id)?;
-    //         }
-    //     }
-
-    //     Ok(res)
-    // }
+    fn unlink(&mut self, path: &str) -> Result<i32> {
+        debug!("unlink: path = {path}");
+        // We should technically be updating the blocks of the inode, but that is pretty hard to do
+        // with this setup. We could possibly track the number of blocks covered by each inode.
+        self.inner.unlink(path)
+    }
 
     fn rmdir(&mut self, path: &str) -> Result<i32> {
         debug!("rmdir: path = {path}");
@@ -295,77 +291,63 @@ where
         self.inner.open(path, fi)
     }
 
-    // fn read(
-    //     &mut self,
-    //     path: &str,
-    //     buf: &mut [u8],
-    //     offset: off_t,
-    //     _fi: Option<&mut fuse_file_info>,
-    // ) -> Result<i32> {
-    //     debug!("read: path = {path}");
+    fn read(
+        &mut self,
+        path: &str,
+        buf: &mut [u8],
+        offset: off_t,
+        _fi: Option<&mut fuse_file_info>,
+    ) -> Result<i32> {
+        debug!("read: path = {path}");
 
-    //     self.load_inode_khf(&path)?;
+        let ipath = self.canonicalize(path);
+        let io = self.new_read_io(&ipath)?;
+        let id = self.mappings.get(&ipath).unwrap();
 
-    //     let ipath = self.inode_path(path);
-    //     let io = self.new_read_io(&ipath)?;
+        let mut tree = LocalizedBKeyTree::new(*id, &mut self.tree);
+        let mut reader = BlockIvCryptIo::<
+            _,
+            LocalizedBKeyTree<'_, R, S, C, KEY_SZ>,
+            R,
+            C,
+            BLOCK_SZ,
+            KEY_SZ,
+        >::new(io, &mut tree, R::default());
 
-    //     let khf_id = self
-    //         .mappings
-    //         .get(&ipath)
-    //         .ok_or(Error::MissingKhf(ipath.clone()))?;
+        reader.seek(SeekFrom::Start(offset as u64))?;
+        Ok(reader.read(buf)? as i32)
+    }
 
-    //     let khf = self
-    //         .inode_khfs
-    //         .get_mut(&khf_id)
-    //         .ok_or(Error::MissingKhf(ipath.clone()))?;
+    fn write(
+        &mut self,
+        path: &str,
+        buf: &[u8],
+        offset: off_t,
+        _fi: Option<&mut fuse_file_info>,
+    ) -> Result<i32> {
+        debug!(
+            "write: path = {path}, offset = {}, size = {}",
+            offset,
+            buf.len()
+        );
 
-    //     let mut reader = BlockIvCryptIo::<_, Khf<R, H, KEY_SZ>, R, C, BLOCK_SZ, KEY_SZ>::new(
-    //         io,
-    //         khf,
-    //         R::default(),
-    //     );
-    //     reader.seek(SeekFrom::Start(offset as u64))?;
-    //     Ok(reader.read(buf)? as i32)
-    // }
+        let ipath = self.canonicalize(path);
+        let io = self.new_rw_io(&ipath)?;
+        let id = self.mappings.get(&ipath).unwrap();
 
-    // fn write(
-    //     &mut self,
-    //     path: &str,
-    //     buf: &[u8],
-    //     offset: off_t,
-    //     _fi: Option<&mut fuse_file_info>,
-    // ) -> Result<i32> {
-    //     debug!(
-    //         "write: path = {path}, offset = {}, size = {}",
-    //         offset,
-    //         buf.len()
-    //     );
+        let mut tree = LocalizedBKeyTree::new(*id, &mut self.tree);
+        let mut writer = BlockIvCryptIo::<
+            _,
+            LocalizedBKeyTree<'_, R, S, C, KEY_SZ>,
+            R,
+            C,
+            BLOCK_SZ,
+            KEY_SZ,
+        >::new(io, &mut tree, R::default());
 
-    //     self.load_inode_khf(&path)?;
-
-    //     let ipath = self.inode_path(path);
-    //     let io = self.new_rw_io(&ipath)?;
-
-    //     let khf_id = self
-    //         .mappings
-    //         .get(&ipath)
-    //         .ok_or(Error::MissingKhf(ipath.clone()))?;
-
-    //     let khf = self
-    //         .inode_khfs
-    //         .get_mut(khf_id)
-    //         .ok_or(Error::MissingKhf(ipath.clone()))?;
-
-    //     self.master_khf.update(*khf_id)?;
-
-    //     let mut writer = BlockIvCryptIo::<_, Khf<R, H, KEY_SZ>, R, C, BLOCK_SZ, KEY_SZ>::new(
-    //         io,
-    //         khf,
-    //         R::default(),
-    //     );
-    //     writer.seek(SeekFrom::Start(offset as u64))?;
-    //     Ok(writer.write(buf)? as i32)
-    // }
+        writer.seek(SeekFrom::Start(offset as u64))?;
+        Ok(writer.write(buf)? as i32)
+    }
 
     fn statfs(&mut self, path: &str, stbuf: Option<&mut statvfs>) -> Result<i32> {
         debug!("statfs: path = {path}");
