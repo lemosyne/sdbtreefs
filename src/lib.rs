@@ -2,6 +2,7 @@ pub mod error;
 mod localize;
 pub mod utils;
 
+use allocator::{seq::SequentialAllocator, Allocator};
 use anyhow::Result;
 use core::ffi::*;
 use crypter::{openssl::Aes256Ctr, Crypter};
@@ -13,6 +14,7 @@ use embedded_io::{
 };
 use error::{Error, Result as SDBResult};
 use fuse_sys::*;
+use localize::LocalizedBKeyTree;
 use log::*;
 use passthrough::Passthrough;
 use rand::{rngs::ThreadRng, CryptoRng, RngCore};
@@ -20,22 +22,23 @@ use sdbtree::{
     storage::{dir::DirectoryStorage, Storage},
     BKeyTree,
 };
+use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, fs::File};
 use umask::Mode;
-
-use crate::localize::LocalizedBKeyTree;
 
 const AES256CTR_KEY_SZ: usize = 32;
 const DEFAULT_BLOCK_SIZE: usize = 4096;
 type Key<const N: usize> = [u8; N];
 
 pub struct SDBTreeFs<
+    A = SequentialAllocator<u64>,
     R = ThreadRng,
     S = DirectoryStorage,
     C = Aes256Ctr,
     const KEY_SZ: usize = AES256CTR_KEY_SZ,
     const BLOCK_SZ: usize = DEFAULT_BLOCK_SIZE,
 > where
+    for<'de> A: Allocator<Id = u64> + Default + Serialize + Deserialize<'de>,
     R: RngCore + CryptoRng + Default,
     S: Storage<Id = u64>,
     C: Crypter,
@@ -44,6 +47,7 @@ pub struct SDBTreeFs<
     mappings: HashMap<String, u64>,
     links: HashMap<u64, u64>,
     inner: Passthrough,
+    allocator: A,
     tree: BKeyTree<R, S, C, KEY_SZ>,
 }
 
@@ -61,8 +65,9 @@ impl SDBTreeFs {
     }
 }
 
-impl<R, S, C, const KEY_SZ: usize, const BLOCK_SZ: usize> SDBTreeFs<R, S, C, KEY_SZ, BLOCK_SZ>
+impl<A, R, S, C, const KEY_SZ: usize, const BLOCK_SZ: usize> SDBTreeFs<A, R, S, C, KEY_SZ, BLOCK_SZ>
 where
+    for<'de> A: Allocator<Id = u64> + Default + Serialize + Deserialize<'de>,
     R: RngCore + CryptoRng + Default,
     S: Storage<Id = u64>,
     C: Crypter,
@@ -77,24 +82,29 @@ where
             mappings: HashMap::new(),
             links: HashMap::new(),
             inner: Passthrough::new::<&str>(datadir.as_ref().into()),
+            allocator: A::default(),
             tree: BKeyTree::with_storage(storage, utils::generate_key(&mut R::default()))
                 .map_err(|_| Error::Storage)?,
         })
     }
 
-    pub fn canonicalize(&self, path: &str) -> String {
+    fn canonicalize(&self, path: &str) -> String {
         self.inner.canonicalize(path).to_string_lossy().to_string()
+    }
+
+    fn localize(id: u64, block: u64) -> u64 {
+        id << 20 | (block & ((1 << 20) - 1))
     }
 
     fn new_read_io(&self, path: &str) -> SDBResult<FromStd<File>> {
         Ok(FromStd::new(File::options().read(true).open(path)?))
     }
 
-    fn new_write_io(&self, path: &str) -> SDBResult<FromStd<File>> {
-        Ok(FromStd::new(
-            File::options().write(true).create(true).open(path)?,
-        ))
-    }
+    // fn new_write_io(&self, path: &str) -> SDBResult<FromStd<File>> {
+    //     Ok(FromStd::new(
+    //         File::options().write(true).create(true).open(path)?,
+    //     ))
+    // }
 
     fn new_rw_io(&self, path: &str) -> SDBResult<FromStd<File>> {
         Ok(FromStd::new(
@@ -107,9 +117,10 @@ where
     }
 }
 
-impl<R, S, C, const KEY_SZ: usize, const BLOCK_SZ: usize> UnthreadedFileSystem
-    for SDBTreeFs<R, S, C, KEY_SZ, BLOCK_SZ>
+impl<A, R, S, C, const KEY_SZ: usize, const BLOCK_SZ: usize> UnthreadedFileSystem
+    for SDBTreeFs<A, R, S, C, KEY_SZ, BLOCK_SZ>
 where
+    for<'de> A: Allocator<Id = u64> + Default + Serialize + Deserialize<'de>,
     R: RngCore + CryptoRng + Default,
     S: Storage<Id = u64>,
     C: Crypter,
@@ -127,7 +138,7 @@ where
         if res == 0 {
             let mode = unsafe { (*raw).st_mode };
             let raw_size = unsafe { (*raw).st_size };
-            if mode & libc::S_IFMT > 0 {
+            if mode & libc::S_IFMT == libc::S_IFREG {
                 let padded_block_size = (BLOCK_SZ + C::iv_length()) as i64;
                 let padded_blocks = (raw_size + padded_block_size - 1) / padded_block_size;
                 let iv_size = padded_blocks * C::iv_length() as i64;
@@ -156,9 +167,35 @@ where
 
     fn unlink(&mut self, path: &str) -> Result<i32> {
         debug!("unlink: path = {path}");
-        // We should technically be updating the blocks of the inode, but that is pretty hard to do
-        // with this setup. We could possibly track the number of blocks covered by each inode.
-        self.inner.unlink(path)
+
+        let res = self.inner.unlink(path)?;
+        if res == 0 {
+            let id = self
+                .mappings
+                .remove(&self.canonicalize(path))
+                .ok_or(Error::Mapping(self.canonicalize(path)))?;
+            let links = self.links.entry(id).or_insert(1);
+
+            *links -= 1;
+
+            if *links == 0 {
+                self.allocator.dealloc(id).map_err(|_| Error::Dealloc(id))?;
+
+                // This is super jank, but we'll just try to remove all the keys.
+                for block in 0.. {
+                    if self
+                        .tree
+                        .remove(&Self::localize(id, block))
+                        .map_err(|_| Error::Storage)?
+                        .is_none()
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+
+        Ok(res)
     }
 
     fn rmdir(&mut self, path: &str) -> Result<i32> {
@@ -166,69 +203,69 @@ where
         self.inner.rmdir(path)
     }
 
-    // fn symlink(&mut self, from: &str, to: &str) -> Result<i32> {
-    //     debug!("symlink: from = {from}, to = {to}");
+    fn symlink(&mut self, from: &str, to: &str) -> Result<i32> {
+        debug!("symlink: from = {from}, to = {to}");
 
-    //     let res = self.inner.symlink(from, to)?;
-    //     if res == 0 {
-    //         let from_ipath = self.inode_path(from);
-    //         let to_ipath = self.inode_path(to);
+        let res = self.inner.symlink(from, to)?;
+        if res == 0 {
+            let from_ipath = self.canonicalize(from);
+            let to_ipath = self.canonicalize(to);
 
-    //         let khf_id = *self
-    //             .mappings
-    //             .get(&from_ipath)
-    //             .ok_or(Error::MissingKhf(from_ipath))?;
+            let id = *self
+                .mappings
+                .get(&from_ipath)
+                .ok_or(Error::Mapping(from_ipath))?;
 
-    //         self.mappings.insert(to_ipath, khf_id);
-    //         *self.links.entry(khf_id).or_insert(0) += 1;
-    //     }
+            self.mappings.insert(to_ipath, id);
+            *self.links.entry(id).or_insert(0) += 1;
+        }
 
-    //     Ok(res)
-    // }
+        Ok(res)
+    }
 
-    // fn rename(&mut self, from: &str, to: &str, flags: c_uint) -> Result<i32> {
-    //     debug!("rename: from = {from}, to = {to}");
+    fn rename(&mut self, from: &str, to: &str, flags: c_uint) -> Result<i32> {
+        debug!("rename: from = {from}, to = {to}");
 
-    //     let res = self.inner.rename(from, to, flags)?;
-    //     if res == 0 {
-    //         let from_ipath = self.inode_path(from);
-    //         let to_ipath = self.inode_path(to);
+        let res = self.inner.rename(from, to, flags)?;
+        if res == 0 {
+            let from_ipath = self.canonicalize(from);
+            let to_ipath = self.canonicalize(to);
 
-    //         let khf_id = self
-    //             .mappings
-    //             .remove(&from_ipath)
-    //             .ok_or(Error::MissingKhf(from_ipath))?;
+            let id = self
+                .mappings
+                .remove(&from_ipath)
+                .ok_or(Error::Mapping(from_ipath))?;
 
-    //         self.mappings.insert(to_ipath, khf_id);
-    //     }
+            self.mappings.insert(to_ipath, id);
+        }
 
-    //     Ok(res)
-    // }
+        Ok(res)
+    }
 
-    // fn link(&mut self, from: &str, to: &str) -> Result<i32> {
-    //     debug!("link: from = {from}, to = {to}");
+    fn link(&mut self, from: &str, to: &str) -> Result<i32> {
+        debug!("link: from = {from}, to = {to}");
 
-    //     let res = self.inner.link(from, to)?;
-    //     if res == 0 {
-    //         let from_ipath = self.inode_path(from);
-    //         let to_ipath = self.inode_path(to);
+        let res = self.inner.link(from, to)?;
+        if res == 0 {
+            let from_ipath = self.canonicalize(from);
+            let to_ipath = self.canonicalize(to);
 
-    //         let khf_id = *self
-    //             .mappings
-    //             .get(&from_ipath)
-    //             .ok_or(Error::MissingKhf(from_ipath))?;
+            let id = *self
+                .mappings
+                .get(&from_ipath)
+                .ok_or(Error::Mapping(from_ipath))?;
 
-    //         self.mappings.insert(to_ipath, khf_id);
-    //         *self.links.entry(khf_id).or_insert(0) += 1;
-    //     }
+            self.mappings.insert(to_ipath, id);
+            *self.links.entry(id).or_insert(0) += 1;
+        }
 
-    //     Ok(res)
-    // }
+        Ok(res)
+    }
 
-    // fn chmod(&mut self, path: &str, mode: mode_t, fi: Option<&mut fuse_file_info>) -> Result<i32> {
-    //     debug!("chmod: path = {path}, mode = {}", Mode::from(mode | 0o666));
-    //     self.inner.chmod(path, mode | 0o666, fi)
-    // }
+    fn chmod(&mut self, path: &str, mode: mode_t, fi: Option<&mut fuse_file_info>) -> Result<i32> {
+        debug!("chmod: path = {path}, mode = {}", Mode::from(mode | 0o666));
+        self.inner.chmod(path, mode | 0o666, fi)
+    }
 
     fn chown(
         &mut self,
@@ -302,9 +339,9 @@ where
 
         let ipath = self.canonicalize(path);
         let io = self.new_read_io(&ipath)?;
-        let id = self.mappings.get(&ipath).unwrap();
+        let id = self.mappings.get(&ipath).ok_or(Error::Mapping(ipath))?;
 
-        let mut tree = LocalizedBKeyTree::new(*id, &mut self.tree);
+        let mut tree = LocalizedBKeyTree::new(*id, Self::localize, &mut self.tree);
         let mut reader = BlockIvCryptIo::<
             _,
             LocalizedBKeyTree<'_, R, S, C, KEY_SZ>,
@@ -333,9 +370,9 @@ where
 
         let ipath = self.canonicalize(path);
         let io = self.new_rw_io(&ipath)?;
-        let id = self.mappings.get(&ipath).unwrap();
+        let id = self.mappings.get(&ipath).ok_or(Error::Mapping(ipath))?;
 
-        let mut tree = LocalizedBKeyTree::new(*id, &mut self.tree);
+        let mut tree = LocalizedBKeyTree::new(*id, Self::localize, &mut self.tree);
         let mut writer = BlockIvCryptIo::<
             _,
             LocalizedBKeyTree<'_, R, S, C, KEY_SZ>,
@@ -404,24 +441,19 @@ where
         self.inner.access(path, mask)
     }
 
-    // fn create(&mut self, path: &str, mode: mode_t, fi: Option<&mut fuse_file_info>) -> Result<i32> {
-    //     debug!("create: path = {path}, mode = {}", Mode::from(mode | 0o666));
+    fn create(&mut self, path: &str, mode: mode_t, fi: Option<&mut fuse_file_info>) -> Result<i32> {
+        debug!("create: path = {path}, mode = {}", Mode::from(mode | 0o666));
 
-    //     let res = self.inner.create(path, mode | 0o666, fi)?;
+        let res = self.inner.create(path, mode | 0o666, fi)?;
 
-    //     let ipath = self.inode_path(path);
-    //     let khf_id = self.allocator.alloc().map_err(|_| Error::Alloc)?;
+        let ipath = self.canonicalize(path);
+        let id = self.allocator.alloc().map_err(|_| Error::Alloc)?;
 
-    //     self.mappings.insert(ipath, khf_id);
-    //     *self.links.entry(khf_id).or_insert(0) += 1;
+        self.mappings.insert(ipath, id);
+        *self.links.entry(id).or_insert(0) += 1;
 
-    //     self.inode_khfs
-    //         .insert(khf_id, Khf::new(&self.inode_khf_fanouts, R::default()));
-
-    //     self.master_khf.update(khf_id)?;
-
-    //     Ok(res)
-    // }
+        Ok(res)
+    }
 
     // NOTE: Doesn't need to be implemented.
     // fn write_buf(

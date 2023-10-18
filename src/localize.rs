@@ -11,6 +11,7 @@ where
     C: Crypter,
 {
     id: u64,
+    localizer: fn(u64, u64) -> u64,
     inner: &'a mut BKeyTree<R, S, C, KEY_SZ>,
 }
 
@@ -20,12 +21,16 @@ where
     S: Storage<Id = u64>,
     C: Crypter,
 {
-    pub fn new(id: u64, inner: &'a mut BKeyTree<R, S, C, KEY_SZ>) -> Self {
-        Self { id, inner }
-    }
-
-    fn localize(&self, block: u64) -> u64 {
-        self.id << 32 | block
+    pub fn new(
+        id: u64,
+        localizer: fn(u64, u64) -> u64,
+        inner: &'a mut BKeyTree<R, S, C, KEY_SZ>,
+    ) -> Self {
+        Self {
+            id,
+            localizer,
+            inner,
+        }
     }
 }
 
@@ -41,11 +46,11 @@ where
     type Error = Error<S::Error>;
 
     fn derive(&mut self, block: Self::KeyId) -> Result<Self::Key, Self::Error> {
-        self.inner.derive(self.localize(block))
+        self.inner.derive((self.localizer)(self.id, block))
     }
 
     fn update(&mut self, block: Self::KeyId) -> Result<Self::Key, Self::Error> {
-        self.inner.update(self.localize(block))
+        self.inner.update((self.localizer)(self.id, block))
     }
 
     fn commit(&mut self) -> Vec<Self::KeyId> {

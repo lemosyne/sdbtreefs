@@ -14,7 +14,7 @@ dependencies = [
 [[package]]
 name = "allocator"
 version = "0.1.0"
-source = "git+https://github.com/lemosyne/allocator#b1c5893b1318882e4288d306d726cf10aca84f33"
+source = "git+https://github.com/lemosyne/allocator.git#b1c5893b1318882e4288d306d726cf10aca84f33"
 dependencies = [
  "num-traits",
  "serde",
@@ -1008,6 +1008,7 @@ dependencies = [
 name = "sdbtreefs"
 version = "0.1.0"
 dependencies = [
+ "allocator",
  "anyhow",
  "clap",
  "crypter",
@@ -1021,6 +1022,7 @@ dependencies = [
  "pretty_env_logger",
  "rand",
  "sdbtree",
+ "serde",
  "thiserror",
  "umask",
 ]
