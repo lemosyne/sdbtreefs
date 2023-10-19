@@ -618,7 +618,7 @@ dependencies = [
 [[package]]
 name = "khf"
 version = "0.1.0"
-source = "git+https://github.com/lemosyne/khf.git#36babad62583058b043484723718185f53701439"
+source = "git+https://github.com/lemosyne/khf.git#eb33e3cfe34a503650e35452a0d1d27fe3e861cc"
 dependencies = [
  "bincode",
  "embedded-io",
@@ -797,7 +797,7 @@ dependencies = [
 [[package]]
 name = "passthrough"
 version = "0.1.0"
-source = "git+https://github.com/lemosyne/passthrough.git#b644428e6d3d21a6d6336fb93eeaadb30529dd2f"
+source = "git+https://github.com/lemosyne/passthrough.git#5f7e2b069e51797206eeeae97a9bf6961166170e"
 dependencies = [
  "anyhow",
  "clap",
@@ -973,9 +973,9 @@ checksum = "08d43f7aa6b08d49f382cde6a7982047c3426db949b1424bc4b7ec9ae12c6ce2"
 
 [[package]]
 name = "rustix"
-version = "0.38.19"
+version = "0.38.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "745ecfa778e66b2b63c88a61cb36e0eea109e803b0b86bf9879fbc77c70e86ed"
+checksum = "67ce50cb2e16c2903e30d1cbccfd8387a74b9d4c938b6a4c5ec6cc7556f7a8a0"
 dependencies = [
  "bitflags 2.4.1",
  "errno",
@@ -1404,7 +1404,7 @@ checksum = "ed94fce61571a4006852b7389a063ab983c02eb1bb37b47f8272ce92d06d9538"
 [[package]]
 name = "xmp"
 version = "0.1.0"
-source = "git+https://github.com/lemosyne/passthrough.git#b644428e6d3d21a6d6336fb93eeaadb30529dd2f"
+source = "git+https://github.com/lemosyne/passthrough.git#5f7e2b069e51797206eeeae97a9bf6961166170e"
 dependencies = [
  "bindgen",
  "cc",

@@ -3,7 +3,7 @@ mod localize;
 pub mod utils;
 
 use allocator::{seq::SequentialAllocator, Allocator};
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use core::ffi::*;
 use crypter::{openssl::Aes256Ctr, Crypter};
 use cryptio::iv::BlockIvCryptIo;
@@ -23,11 +23,14 @@ use sdbtree::{
     BKeyTree,
 };
 use serde::{Deserialize, Serialize};
+use std::env;
+use std::marker::PhantomData;
 use std::{collections::HashMap, fs::File};
 use umask::Mode;
 
 const AES256CTR_KEY_SZ: usize = 32;
 const DEFAULT_BLOCK_SIZE: usize = 4096;
+const DEFAULT_DEGREE: usize = 2;
 type Key<const N: usize> = [u8; N];
 
 pub struct SDBTreeFs<
@@ -63,29 +66,51 @@ impl SDBTreeFs {
             DirectoryStorage::new(metadir.as_ref()).map_err(|_| Error::Storage)?,
         )
     }
+
+    pub fn options() -> SDBTreeFsBuilder<
+        SequentialAllocator<u64>,
+        ThreadRng,
+        DirectoryStorage,
+        Aes256Ctr,
+        AES256CTR_KEY_SZ,
+        DEFAULT_BLOCK_SIZE,
+    > {
+        Self::custom_options()
+    }
 }
 
 impl<A, R, S, C, const KEY_SZ: usize, const BLOCK_SZ: usize> SDBTreeFs<A, R, S, C, KEY_SZ, BLOCK_SZ>
 where
-    for<'de> A: Allocator<Id = u64> + Default + Serialize + Deserialize<'de>,
-    R: RngCore + CryptoRng + Default,
-    S: Storage<Id = u64>,
-    C: Crypter,
+    for<'de> A: Allocator<Id = u64> + Default + Serialize + Deserialize<'de> + 'static,
+    R: RngCore + CryptoRng + Default + 'static,
+    S: Storage<Id = u64> + 'static,
+    C: Crypter + 'static,
 {
     pub fn custom(
         enclave: impl AsRef<str>,
         datadir: impl AsRef<str>,
         storage: S,
     ) -> SDBResult<Self> {
-        Ok(Self {
-            enclave: enclave.as_ref().into(),
-            mappings: HashMap::new(),
-            links: HashMap::new(),
-            inner: Passthrough::new::<&str>(datadir.as_ref().into()),
-            allocator: A::default(),
-            tree: BKeyTree::with_storage(storage, utils::generate_key(&mut R::default()))
-                .map_err(|_| Error::Storage)?,
-        })
+        Ok(Self::custom_options().build(enclave, datadir, storage)?)
+    }
+
+    pub fn custom_options() -> SDBTreeFsBuilder<A, R, S, C, KEY_SZ, BLOCK_SZ> {
+        SDBTreeFsBuilder::new()
+    }
+
+    pub fn mount(self, mount: impl AsRef<str>) -> Result<()> {
+        let exec = env::args().next().unwrap().to_string();
+
+        let mut args = vec![exec.as_str(), mount.as_ref()];
+        if self.inner.is_debug() {
+            args.push("-d");
+        }
+        if self.inner.is_foreground() {
+            args.push("-f");
+        }
+
+        self.run(&args)
+            .map_err(|err| anyhow!("unexpected FUSE error: {err}"))
     }
 
     fn canonicalize(&self, path: &str) -> String {
@@ -100,11 +125,11 @@ where
         Ok(FromStd::new(File::options().read(true).open(path)?))
     }
 
-    // fn new_write_io(&self, path: &str) -> SDBResult<FromStd<File>> {
-    //     Ok(FromStd::new(
-    //         File::options().write(true).create(true).open(path)?,
-    //     ))
-    // }
+    fn new_write_io(&self, path: &str) -> SDBResult<FromStd<File>> {
+        Ok(FromStd::new(
+            File::options().write(true).create(true).open(path)?,
+        ))
+    }
 
     fn new_rw_io(&self, path: &str) -> SDBResult<FromStd<File>> {
         Ok(FromStd::new(
@@ -120,10 +145,10 @@ where
 impl<A, R, S, C, const KEY_SZ: usize, const BLOCK_SZ: usize> UnthreadedFileSystem
     for SDBTreeFs<A, R, S, C, KEY_SZ, BLOCK_SZ>
 where
-    for<'de> A: Allocator<Id = u64> + Default + Serialize + Deserialize<'de>,
-    R: RngCore + CryptoRng + Default,
-    S: Storage<Id = u64>,
-    C: Crypter,
+    for<'de> A: Allocator<Id = u64> + Default + Serialize + Deserialize<'de> + 'static,
+    R: RngCore + CryptoRng + Default + 'static,
+    S: Storage<Id = u64> + 'static,
+    C: Crypter + 'static,
 {
     fn getattr(
         &mut self,
@@ -401,17 +426,32 @@ where
         self.inner.release(path, fi)
     }
 
-    // fn fsync(
-    //     &mut self,
-    //     path: &str,
-    //     isdatasync: c_int,
-    //     fi: Option<&mut fuse_file_info>,
-    // ) -> Result<i32> {
-    //     debug!("fsync: path = {path}");
-    //     let res = self.inner.fsync(path, isdatasync, fi)?;
-    //     self.persist()?;
-    //     Ok(res)
-    // }
+    fn fsync(
+        &mut self,
+        path: &str,
+        isdatasync: c_int,
+        fi: Option<&mut fuse_file_info>,
+    ) -> Result<i32> {
+        debug!("fsync: path = {path}");
+        let res = self.inner.fsync(path, isdatasync, fi)?;
+        if res == 0 {
+            let ipath = self.canonicalize(path);
+            let id = self.mappings.get(&ipath).ok_or(Error::Mapping(ipath))?;
+
+            // This is super jank, but we just need to find and persist the nodes containing the
+            // block keys for the inode.
+            for block in 0.. {
+                if !self
+                    .tree
+                    .persist_block(&Self::localize(*id, block))
+                    .map_err(|_| Error::Storage)?
+                {
+                    break;
+                }
+            }
+        }
+        Ok(res)
+    }
 
     fn opendir(&mut self, path: &str, fi: Option<&mut fuse_file_info>) -> Result<i32> {
         debug!("opendir: path = {path}");
@@ -491,5 +531,71 @@ where
     ) -> Result<i32> {
         debug!("lock: path = {path}");
         self.inner.lock(path, fi, cmd, lock)
+    }
+}
+
+pub struct SDBTreeFsBuilder<A, R, S, C, const KEY_SZ: usize, const BLOCK_SZ: usize>
+where
+    for<'de> A: Allocator<Id = u64> + Default + Serialize + Deserialize<'de>,
+    R: RngCore + CryptoRng + Default,
+    S: Storage<Id = u64>,
+    C: Crypter,
+{
+    debug: bool,
+    foreground: bool,
+    degree: usize,
+    pd: PhantomData<(A, R, S, C)>,
+}
+
+impl<A, R, S, C, const KEY_SZ: usize, const BLOCK_SZ: usize>
+    SDBTreeFsBuilder<A, R, S, C, KEY_SZ, BLOCK_SZ>
+where
+    for<'de> A: Allocator<Id = u64> + Default + Serialize + Deserialize<'de>,
+    R: RngCore + CryptoRng + Default,
+    S: Storage<Id = u64>,
+    C: Crypter,
+{
+    pub fn new() -> Self {
+        Self {
+            debug: true,
+            foreground: true,
+            degree: DEFAULT_DEGREE,
+            pd: PhantomData,
+        }
+    }
+
+    pub fn debug(mut self, debug: bool) -> Self {
+        self.debug = debug;
+        self
+    }
+
+    pub fn foreground(mut self, foreground: bool) -> Self {
+        self.foreground = foreground;
+        self
+    }
+
+    pub fn degree(mut self, degree: usize) -> Self {
+        self.degree = degree;
+        self
+    }
+
+    pub fn build(
+        self,
+        enclave: impl AsRef<str>,
+        datadir: impl AsRef<str>,
+        storage: S,
+    ) -> SDBResult<SDBTreeFs<A, R, S, C, KEY_SZ, BLOCK_SZ>> {
+        Ok(SDBTreeFs {
+            enclave: enclave.as_ref().into(),
+            mappings: HashMap::new(),
+            links: HashMap::new(),
+            inner: Passthrough::options()
+                .debug(self.debug)
+                .foreground(self.foreground)
+                .build::<&str>(datadir.as_ref().into()),
+            allocator: A::default(),
+            tree: BKeyTree::with_storage(storage, utils::generate_key(&mut R::default()))
+                .map_err(|_| Error::Storage)?,
+        })
     }
 }
