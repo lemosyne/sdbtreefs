@@ -264,7 +264,7 @@ dependencies = [
 [[package]]
 name = "cryptio"
 version = "0.1.0"
-source = "git+https://github.com/lemosyne/cryptio.git#4a24373f62fd24434eead8ac44288c55a5079dc7"
+source = "git+https://github.com/lemosyne/cryptio.git#a3049cbcfc5a1acbe3273cd928f5c37f844f2c64"
 dependencies = [
  "crypter",
  "embedded-io",
