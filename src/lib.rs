@@ -1,5 +1,6 @@
 pub mod error;
 mod localize;
+pub mod persist;
 pub mod utils;
 
 use allocator::{seq::SequentialAllocator, Allocator};
@@ -46,23 +47,27 @@ pub struct SDBTreeFs<
     S: Storage<Id = u64>,
     C: Crypter,
 {
-    enclave: String,
+    root_id: u64,
+    root_key: Key<KEY_SZ>,
+    tree: BKeyTree<R, S, C, KEY_SZ>,
+    enclave: FromStd<File>,
+    metadir: String,
     mappings: HashMap<String, u64>,
     links: HashMap<u64, u64>,
     inner: Passthrough,
     allocator: A,
-    tree: BKeyTree<R, S, C, KEY_SZ>,
 }
 
 impl SDBTreeFs {
     pub fn new(
         enclave: impl AsRef<str>,
-        metadir: impl AsRef<str>,
         datadir: impl AsRef<str>,
+        metadir: impl AsRef<str>,
     ) -> SDBResult<Self> {
         Self::custom(
             enclave,
             datadir,
+            metadir.as_ref(),
             DirectoryStorage::new(metadir.as_ref()).map_err(|_| Error::Storage)?,
         )
     }
@@ -89,16 +94,22 @@ where
     pub fn custom(
         enclave: impl AsRef<str>,
         datadir: impl AsRef<str>,
+        metadir: impl AsRef<str>,
         storage: S,
     ) -> SDBResult<Self> {
-        Ok(Self::custom_options().build(enclave, datadir, storage)?)
+        Ok(Self::custom_options().build(enclave, datadir, metadir, storage)?)
     }
 
     pub fn custom_options() -> SDBTreeFsBuilder<A, R, S, C, KEY_SZ, BLOCK_SZ> {
         SDBTreeFsBuilder::new()
     }
 
-    pub fn mount(self, mount: impl AsRef<str>) -> Result<()> {
+    pub fn mount(mut self, mount: impl AsRef<str>) -> Result<()> {
+        // Before we mount, we can try to load state.
+        if self.is_loadable()? {
+            self.load()?;
+        }
+
         let exec = env::args().next().unwrap().to_string();
 
         let mut args = vec![exec.as_str(), mount.as_ref()];
@@ -119,26 +130,6 @@ where
 
     fn localize(id: u64, block: u64) -> u64 {
         id << 20 | (block & ((1 << 20) - 1))
-    }
-
-    fn new_read_io(&self, path: &str) -> SDBResult<FromStd<File>> {
-        Ok(FromStd::new(File::options().read(true).open(path)?))
-    }
-
-    fn new_write_io(&self, path: &str) -> SDBResult<FromStd<File>> {
-        Ok(FromStd::new(
-            File::options().write(true).create(true).open(path)?,
-        ))
-    }
-
-    fn new_rw_io(&self, path: &str) -> SDBResult<FromStd<File>> {
-        Ok(FromStd::new(
-            File::options()
-                .read(true)
-                .write(true)
-                .create(true)
-                .open(path)?,
-        ))
     }
 }
 
@@ -363,7 +354,7 @@ where
         debug!("read: path = {path}");
 
         let ipath = self.canonicalize(path);
-        let io = self.new_read_io(&ipath)?;
+        let io = Self::new_read_io(&ipath)?;
         let id = self.mappings.get(&ipath).ok_or(Error::Mapping(ipath))?;
 
         let mut tree = LocalizedBKeyTree::new(*id, Self::localize, &mut self.tree);
@@ -394,7 +385,7 @@ where
         );
 
         let ipath = self.canonicalize(path);
-        let io = self.new_rw_io(&ipath)?;
+        let io = Self::new_write_io(&ipath)?;
         let id = self.mappings.get(&ipath).ok_or(Error::Mapping(ipath))?;
 
         let mut tree = LocalizedBKeyTree::new(*id, Self::localize, &mut self.tree);
@@ -583,10 +574,23 @@ where
         self,
         enclave: impl AsRef<str>,
         datadir: impl AsRef<str>,
+        metadir: impl AsRef<str>,
         storage: S,
     ) -> SDBResult<SDBTreeFs<A, R, S, C, KEY_SZ, BLOCK_SZ>> {
+        let root_key = utils::generate_key(&mut R::default());
+
         Ok(SDBTreeFs {
-            enclave: enclave.as_ref().into(),
+            root_id: 0,
+            root_key,
+            tree: BKeyTree::with_storage(storage, root_key).map_err(|_| Error::Storage)?,
+            enclave: FromStd::new(
+                File::options()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .open(enclave.as_ref())?,
+            ),
+            metadir: metadir.as_ref().into(),
             mappings: HashMap::new(),
             links: HashMap::new(),
             inner: Passthrough::options()
@@ -594,8 +598,6 @@ where
                 .foreground(self.foreground)
                 .build::<&str>(datadir.as_ref().into()),
             allocator: A::default(),
-            tree: BKeyTree::with_storage(storage, utils::generate_key(&mut R::default()))
-                .map_err(|_| Error::Storage)?,
         })
     }
 }

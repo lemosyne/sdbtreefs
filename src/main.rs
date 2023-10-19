@@ -50,8 +50,9 @@ fn main() -> Result<()> {
         .degree(args.degree)
         .build(
             &args.enclave,
+            &args.datadir,
             &args.metadir,
-            DirectoryStorage::new(&args.datadir)?,
+            DirectoryStorage::new(&args.metadir)?,
         )?
         .mount(args.mount)
 }

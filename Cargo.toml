@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 allocator = { git = "https://github.com/lemosyne/allocator.git", features = ["seq"] }
 anyhow = "1.0.70"
+bincode = "1.3.3"
 clap = { version = "4.4.6", features = ["derive"] }
 crypter = { git = "https://github.com/lemosyne/crypter.git", features = ["openssl"] }
 cryptio = { git = "https://github.com/lemosyne/cryptio.git" }

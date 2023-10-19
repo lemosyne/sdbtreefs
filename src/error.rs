@@ -17,6 +17,12 @@ pub enum Error {
 
     #[error("storage error")]
     Storage,
+
+    #[error("enclave error")]
+    Enclave,
+
+    #[error(transparent)]
+    Serde(#[from] bincode::Error),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
